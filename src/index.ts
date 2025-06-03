@@ -4,6 +4,7 @@ interface Env {
 	DB_URL: string;
 	RPC_URL: string;
 	RPCX_URL: string;
+	AUTH_HEADER: string;
 }
 
 function getDb(dbUrl: string) {
@@ -101,6 +102,11 @@ export default {
 	async fetch(request, env: Env, _ctx): Promise<Response> {
 		if (request.method !== "POST") {
 			return new Response("Method Not Allowed", { status: 405 });
+		}
+
+		const authHeader = request.headers.get('Authorization');
+		if (authHeader !== env.AUTH_HEADER) {
+			return new Response("Unauthorized", { status: 401 });
 		}
 
 		const db = getDb(env.DB_URL);

@@ -32,7 +32,7 @@ async function upsertTransaction(db: postgres.Sql, programId: string, programNam
 		db,
 		tableName,
 		`signature TEXT PRIMARY KEY, feePayer TEXT, name TEXT, data JSONB, accounts TEXT[]`,
-		`Table for storing transactions for program ${programName} (${programId})`
+		`${programName}: transactions for program (${programId})`
 	);
 
 	await db`

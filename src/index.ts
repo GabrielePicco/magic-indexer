@@ -1,5 +1,7 @@
 import postgres from 'postgres';
 
+const DELEGATION_PROGRAM = "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh";
+
 interface Env {
 	DB_URL: string;
 	RPC_URL: string;
@@ -28,11 +30,17 @@ async function upsertTransaction(db: postgres.Sql, programId: string, programNam
 	signature: string;
 }) {
 	const tableName = `${`txs_program_${programId}`.toLowerCase()}`;
+
 	await ensureTableExists(
 		db,
 		tableName,
-		`signature TEXT PRIMARY KEY, feePayer TEXT, name TEXT, data JSONB, accounts TEXT[]`,
-		`${programName}: transactions for program (${programId})`
+		`signature TEXT PRIMARY KEY,
+		   feePayer TEXT,
+		   name TEXT,
+		   data JSONB,
+		   accounts TEXT[],
+		   timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP`,
+		   `${programName}: transactions for program (${programId})`
 	);
 
 	await db`
@@ -68,6 +76,29 @@ async function upsertParsedAccount(db: postgres.Sql, acc: any) {
 				space = EXCLUDED.space,
 				lamports = EXCLUDED.lamports
 		`;
+}
+
+
+// Function to extract program ID from log messages
+function extractProgramIdFromLogs(logMessages: string[], targetLogMessage: string): string | null {
+	try {
+		const targetLogIndex = logMessages.findIndex(msg =>
+			msg.includes(targetLogMessage)
+		);
+		if (targetLogIndex <= 0) {
+			return null;
+		}
+		for (let i = targetLogIndex - 1; i >= 0; i--) {
+			const currentMsg = logMessages[i];
+			const programInvokeMatch = currentMsg.match(/^Program\s+([A-HJ-NP-Za-km-z1-9]{32,44})\s+invoke\s+\[1\]$/);
+			if (programInvokeMatch) {
+				return programInvokeMatch[1];
+			}
+		}
+		return null;
+	} catch (error: any) {
+		return null;
+	}
 }
 
 async function rpcFetch(rpcUrl: string, rpcxUrl: string,  method: string, params: any): Promise<any> {
@@ -125,6 +156,25 @@ export default {
 			const txResult = await rpcFetch(env.RPC_URL, env.RPCX_URL, "getParsedTransaction", [signature, { commitment: "confirmed" }]);
 			const message = txResult?.transaction?.message;
 			const feePayer = message?.accountKeys?.[0];
+			// @ts-ignore
+			const logMessages = body?.[0]?.meta?.logMessages
+
+			// @ts-ignore
+			if(accountKeys.includes(DELEGATION_PROGRAM) && logMessages.some(msg => msg.includes("Program log: Processing instruction: Delegate"))){
+				console.log("Contains delegation")
+				const extractedProgramId = extractProgramIdFromLogs(
+					logMessages,
+					"Program log: Processing instruction: Delegate"
+				);
+				console.log(extractedProgramId)
+				await upsertTransaction(db, DELEGATION_PROGRAM, "Delegation Program", {
+					feePayer,
+					name: "Delegate",
+					data: {program: extractedProgramId},
+					accounts: accountKeys,
+					signature
+				});
+			}
 
 			let txPromises = Promise.all(
 				(message?.instructions || []).map(async (inst: any) => {

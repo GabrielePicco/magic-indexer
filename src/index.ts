@@ -45,7 +45,7 @@ async function upsertTransaction(db: postgres.Sql, programId: string, programNam
 
 	await db`
 		INSERT INTO ${db(tableName)} (signature, feePayer, name, data, accounts)
-		VALUES (${tx.signature}, ${tx.feePayer}, ${tx.name}, ${JSON.stringify(tx.data)}, ${tx.accounts})
+		VALUES (${tx.signature}, ${tx.feePayer}, ${tx.name}, ${tx.data}, ${tx.accounts})
 		ON CONFLICT (signature) DO UPDATE SET
 			name = EXCLUDED.name,
 			data = EXCLUDED.data,
@@ -66,10 +66,9 @@ async function upsertParsedAccount(db: postgres.Sql, acc: any) {
 		lamports BIGINT
 	`, 'Stores parsed account data indexed by pubkey for a specific Solana program.');
 
-	const data = JSON.stringify(acc.data);
 	await db`
 			INSERT INTO ${db(tableName)} (pubkey, data, type, space, lamports)
-			VALUES (${acc.key}, ${data}, ${acc.name}, ${acc.space}, ${acc.lamports})
+			VALUES (${acc.key}, ${acc.data}, ${acc.name}, ${acc.space}, ${acc.lamports})
 			ON CONFLICT (pubkey) DO UPDATE SET
 				data = EXCLUDED.data,
 				type = EXCLUDED.type,

@@ -21,11 +21,27 @@ async function ensureTableExists(db: postgres.Sql, tableName: string, schema: st
 	}
 }
 
+async function columnExists(db: postgres.Sql, tableName: string, columnName: string): Promise<boolean> {
+	const result = await db`
+		SELECT 1
+		FROM information_schema.columns
+		WHERE table_name = ${tableName} AND column_name = ${columnName}
+	`;
+	return result.length > 0;
+}
+
+async function addColumnIfMissing(db: postgres.Sql, tableName: string, columnName: string, columnType: string) {
+	if (!(await columnExists(db, tableName, columnName))) {
+		await db.unsafe(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnType}`);
+	}
+}
+
 
 async function upsertTransaction(db: postgres.Sql, programId: string, programName: string, tx: {
 	feePayer: string;
 	data: any;
 	name: string;
+	events: string[];
 	accounts: string[];
 	signature: string;
 }) {
@@ -43,13 +59,16 @@ async function upsertTransaction(db: postgres.Sql, programId: string, programNam
 		   `${programName}: transactions for program (${programId})`
 	);
 
+	await addColumnIfMissing(db, tableName, "events", "JSONB");
+
 	await db`
-		INSERT INTO ${db(tableName)} (signature, feePayer, name, data, accounts)
-		VALUES (${tx.signature}, ${tx.feePayer}, ${tx.name}, ${tx.data}, ${tx.accounts})
+		INSERT INTO ${db(tableName)} (signature, feePayer, name, data, accounts, events)
+		VALUES (${tx.signature}, ${tx.feePayer}, ${tx.name}, ${tx.data}, ${tx.accounts}, ${tx.events})
 		ON CONFLICT (signature) DO UPDATE SET
 			name = EXCLUDED.name,
 			data = EXCLUDED.data,
-			accounts = EXCLUDED.accounts
+			accounts = EXCLUDED.accounts,
+			events = EXCLUDED.events
 	`;
 }
 
@@ -157,6 +176,8 @@ export default {
 			const feePayer = message?.accountKeys?.[0];
 			// @ts-ignore
 			const logMessages = body?.[0]?.meta?.logMessages
+			// @ts-ignore
+			const events  = txResult?.transaction?.events || [];
 
 			// @ts-ignore
 			if(accountKeys.includes(DELEGATION_PROGRAM) && logMessages.some(msg => msg.includes("Program log: Processing instruction: Delegate"))){
@@ -171,6 +192,7 @@ export default {
 					name: "Delegate",
 					data: {program: extractedProgramId},
 					accounts: accountKeys,
+					events,
 					signature
 				});
 			}
@@ -183,6 +205,7 @@ export default {
 							feePayer,
 							name: inst.name,
 							data: inst.parsedData,
+							events,
 							accounts,
 							signature
 						});

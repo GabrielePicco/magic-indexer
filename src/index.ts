@@ -1,5 +1,7 @@
 import postgres from 'postgres';
 
+const DELEGATION_PROGRAM = 'DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh';
+
 interface Env {
 	DB_URL: string;
 	RPC_URL: string;
@@ -100,29 +102,6 @@ async function upsertParsedAccount(db: postgres.Sql, acc: any) {
 	`;
 }
 
-
-// Function to extract program ID from log messages
-function extractProgramIdFromLogs(logMessages: string[], targetLogMessage: string): string | null {
-	try {
-		const targetLogIndex = logMessages.findIndex(msg =>
-			msg.includes(targetLogMessage)
-		);
-		if (targetLogIndex <= 0) {
-			return null;
-		}
-		for (let i = targetLogIndex - 1; i >= 0; i--) {
-			const currentMsg = logMessages[i];
-			const programInvokeMatch = currentMsg.match(/^Program\s+([A-HJ-NP-Za-km-z1-9]{32,44})\s+invoke\s+\[1\]$/);
-			if (programInvokeMatch) {
-				return programInvokeMatch[1];
-			}
-		}
-		return null;
-	} catch (error: any) {
-		return null;
-	}
-}
-
 async function rpcFetch(rpcUrl: string, rpcxUrl: string, method: string, params: any): Promise<any> {
 	const body = {
 		jsonrpc: '2.0',
@@ -178,11 +157,51 @@ export default {
 			const txResult = await rpcFetch(env.RPC_URL, env.RPCX_URL, 'getParsedTransaction', [signature, { commitment: 'confirmed' }]);
 			const message = txResult?.transaction?.message;
 			const feePayer = message?.accountKeys?.[0];
-			// @ts-ignore
-			const logMessages = body?.[0]?.meta?.logMessages;
-			// @ts-ignore
 			const events = txResult?.transaction?.events || [];
 
+			// Detect if the transaction contains delegations
+			const delegationMatches: {
+				parentProgramId: string;
+			}[] = [];
+			const isDelegation = txResult.meta.innerInstructions?.some((innerInstruction: any) => {
+				try {
+					return innerInstruction.instructions?.some((ix: any) => {
+						const mappedProgramId = accountKeys?.[ix.programIdIndex];
+						const parentIndex = innerInstruction.index;
+						const parentProgramId = accountKeys?.[
+							txResult.transaction.message.instructions[parentIndex]?.programIdIndex
+							];
+
+						const match =
+							mappedProgramId === DELEGATION_PROGRAM &&
+							typeof ix.data === 'string' &&
+							ix.data.startsWith('11111111');
+
+						if (match) {
+							delegationMatches.push({
+								parentProgramId: parentProgramId ?? 'unknown'
+							});
+						}
+
+						return match;
+					});
+				} catch {
+					return false;
+				}
+			});
+			if (isDelegation) {
+				const extractedProgramId = delegationMatches[0].parentProgramId;
+				await upsertTransaction(db, DELEGATION_PROGRAM, 'Delegation Program', {
+					feePayer,
+					name: 'delegate',
+					data: { program: extractedProgramId },
+					accounts: accountKeys,
+					events,
+					signature
+				});
+			}
+
+			// Parse
 			let txPromises = Promise.all(
 				(message?.instructions || []).map(async (inst: any) => {
 					if (inst.programId && inst.parsedData) {

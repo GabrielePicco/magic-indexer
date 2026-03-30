@@ -9,6 +9,71 @@ interface Env {
 	AUTH_HEADER: string;
 }
 
+function isDefined<T>(value: T | null | undefined): value is T {
+	return value !== undefined && value !== null;
+}
+
+function normalizeAccountKey(accountKey: any): string | undefined {
+	if (typeof accountKey === 'string') return accountKey;
+	if (typeof accountKey?.pubkey === 'string') return accountKey.pubkey;
+	return undefined;
+}
+
+function normalizeAccountKeys(accountKeys: any): string[] {
+	if (!Array.isArray(accountKeys)) return [];
+
+	return accountKeys.filter(Boolean).map((accountKey: any) => normalizeAccountKey(accountKey)).filter(isDefined);
+}
+
+function getInstructionProgramId(inst: any, accountKeys: string[]): string | undefined {
+	if (typeof inst?.programId === 'string') return inst.programId;
+	if (typeof inst?.programIdIndex === 'number') return accountKeys[inst.programIdIndex];
+	return undefined;
+}
+
+function getInstructionAccounts(inst: any, accountKeys: string[]): string[] {
+	if (!Array.isArray(inst?.accounts)) return [];
+
+	if (inst.accounts.every((account: any) => typeof account === 'number')) {
+		return inst.accounts.map((idx: number) => accountKeys[idx]).filter(isDefined);
+	}
+
+	return inst.accounts.map((account: any) => normalizeAccountKey(account)).filter(isDefined);
+}
+
+function getInstructionName(inst: any): string {
+	return inst?.name || inst?.parsed?.type || inst?.programName || inst?.program || 'raw';
+}
+
+function getInstructionData(inst: any, accounts: string[]): any {
+	if (inst?.parsedData) return inst.parsedData;
+	if (inst?.parsed?.info) return inst.parsed.info;
+	if (inst?.parsed) return inst.parsed;
+	if (typeof inst?.data === 'string' && accounts.length > 0) {
+		return {
+			rawData: inst.data,
+			accounts
+		};
+	}
+
+	return null;
+}
+
+function normalizeParsedAccount(pubkey: string, account: any) {
+	const parsed = account?.data?.parsed;
+	if (!parsed) return null;
+
+	return {
+		key: pubkey,
+		data: parsed.info ?? parsed,
+		name: parsed.type,
+		space: account.space,
+		lamports: account.lamports,
+		owner: account.owner,
+		parsed: true
+	};
+}
+
 function getDb(dbUrl: string) {
 	return postgres(dbUrl);
 }
@@ -103,6 +168,16 @@ async function upsertParsedAccount(db: postgres.Sql, acc: any) {
 }
 
 async function rpcFetch(rpcUrl: string, rpcxUrl: string, method: string, params: any): Promise<any> {
+	return rpcRequest(rpcxUrl, {
+		'Rpc': rpcUrl
+	}, method, params);
+}
+
+async function rpcFetchDirect(rpcUrl: string, method: string, params: any): Promise<any> {
+	return rpcRequest(rpcUrl, {}, method, params);
+}
+
+async function rpcRequest(url: string, headers: Record<string, string>, method: string, params: any): Promise<any> {
 	const body = {
 		jsonrpc: '2.0',
 		id: '0',
@@ -110,25 +185,73 @@ async function rpcFetch(rpcUrl: string, rpcxUrl: string, method: string, params:
 		params
 	};
 
-	const res = await fetch(rpcxUrl, {
+	const res = await fetch(url, {
 		method: 'POST',
 		headers: {
 			'Content-Type': 'application/json',
-			'Rpc': rpcUrl
+			...headers
 		},
 		body: JSON.stringify(body)
 	});
 
+	const text = await res.text();
 	if (!res.ok) {
-		throw new Error(`RPC error: ${await res.text()}`);
+		throw new Error(`RPC ${method} failed: ${text}`);
 	}
 
-	const json = await res.json();
-	// @ts-ignore
-	if (!json.result) throw new Error('RPC result missing');
-	// @ts-ignore
+	let json;
+	try {
+		json = JSON.parse(text);
+	} catch {
+		throw new Error(`RPC ${method} returned non-JSON: ${text}`);
+	}
+
+	if (json?.error) {
+		throw new Error(`RPC ${method} error (${json.error.code}): ${json.error.message}`);
+	}
+
+	if (!('result' in json)) throw new Error(`RPC ${method} result missing`);
 	return json.result;
 }
+
+async function fetchParsedTransaction(rpcUrl: string, rpcxUrl: string, signature: string): Promise<any> {
+	try {
+		return await rpcFetch(rpcUrl, rpcxUrl, 'getParsedTransaction', [signature, { commitment: 'confirmed' }]);
+	} catch (_error) {
+		return rpcFetchDirect(rpcUrl, 'getTransaction', [signature, {
+			commitment: 'confirmed',
+			encoding: 'jsonParsed',
+			maxSupportedTransactionVersion: 0
+		}]);
+	}
+}
+
+async function fetchParsedAccounts(rpcUrl: string, rpcxUrl: string, accountKeys: string[]): Promise<any> {
+	if (accountKeys.length === 0) return { value: [] };
+
+	try {
+		return await rpcFetch(rpcUrl, rpcxUrl, 'getParsedAccountsData', {
+			pubkeys: accountKeys,
+			commitment: 'processed',
+			onlyParsed: true
+		});
+	} catch (_error) {
+		const result = await rpcFetchDirect(rpcUrl, 'getMultipleAccounts', [accountKeys, {
+			commitment: 'processed',
+			encoding: 'jsonParsed'
+		}]);
+
+		return {
+			value: (result?.value || []).map((account: any, index: number) => normalizeParsedAccount(accountKeys[index], account))
+		};
+	}
+}
+
+export const __testables = {
+	fetchParsedAccounts,
+	fetchParsedTransaction,
+	getInstructionData
+};
 
 export default {
 	async fetch(request, env: Env, _ctx): Promise<Response> {
@@ -144,33 +267,34 @@ export default {
 		const db = getDb(env.DB_URL);
 
 		try {
-			const body = await request.json();
-			// @ts-ignore
+			const body: any = await request.json();
 			const signature = body?.[0]?.transaction?.signatures?.[0];
-			// @ts-ignore
-			const accountKeys = body?.[0]?.transaction?.message?.accountKeys;
+			const accountKeys = normalizeAccountKeys(body?.[0]?.transaction?.message?.accountKeys);
 
-			if (!signature || !accountKeys) {
+			if (!signature || accountKeys.length === 0) {
 				return new Response('Invalid input', { status: 400 });
 			}
 
-			const txResult = await rpcFetch(env.RPC_URL, env.RPCX_URL, 'getParsedTransaction', [signature, { commitment: 'confirmed' }]);
+			const txResult = await fetchParsedTransaction(env.RPC_URL, env.RPCX_URL, signature);
 			const message = txResult?.transaction?.message;
-			const feePayer = message?.accountKeys?.[0];
+			const resolvedAccountKeys = normalizeAccountKeys(message?.accountKeys);
+			const txAccountKeys = resolvedAccountKeys.length > 0 ? resolvedAccountKeys : accountKeys;
+			const feePayer = normalizeAccountKey(message?.accountKeys?.[0]) ?? txAccountKeys[0];
 			const events = txResult?.transaction?.events || [];
 
 			// Detect if the transaction contains delegations
 			const delegationMatches: {
 				parentProgramId: string;
 			}[] = [];
-			const isDelegation = txResult.meta.innerInstructions?.some((innerInstruction: any) => {
+			const isDelegation = txResult.meta?.innerInstructions?.some((innerInstruction: any) => {
 				try {
 					return innerInstruction.instructions?.some((ix: any) => {
-						const mappedProgramId = accountKeys?.[ix.programIdIndex];
+						const mappedProgramId = getInstructionProgramId(ix, txAccountKeys);
 						const parentIndex = innerInstruction.index;
-						const parentProgramId = accountKeys?.[
-							txResult.transaction.message.instructions[parentIndex]?.programIdIndex
-							];
+						const parentProgramId = getInstructionProgramId(
+							txResult.transaction.message.instructions[parentIndex],
+							txAccountKeys
+						);
 
 						const match =
 							mappedProgramId === DELEGATION_PROGRAM &&
@@ -195,7 +319,7 @@ export default {
 					feePayer,
 					name: 'delegate',
 					data: { program: extractedProgramId },
-					accounts: accountKeys,
+					accounts: txAccountKeys,
 					events,
 					signature
 				});
@@ -204,12 +328,15 @@ export default {
 			// Parse
 			let txPromises = Promise.all(
 				(message?.instructions || []).map(async (inst: any) => {
-					if (inst.programId && inst.parsedData) {
-						const accounts = (inst.accounts || []).map((idx: number) => accountKeys[idx]);
-						await upsertTransaction(db, inst.programId, inst.programName, {
+					const programId = getInstructionProgramId(inst, txAccountKeys);
+					const accounts = getInstructionAccounts(inst, txAccountKeys);
+					const data = getInstructionData(inst, accounts);
+
+					if (programId && data) {
+						await upsertTransaction(db, programId, inst.programName || inst.program || programId, {
 							feePayer,
-							name: inst.name,
-							data: inst.parsedData,
+							name: getInstructionName(inst),
+							data,
 							events,
 							accounts,
 							signature
@@ -218,15 +345,15 @@ export default {
 				})
 			);
 
-			const parsedData = await rpcFetch(env.RPC_URL, env.RPCX_URL, 'getParsedAccountsData', {
-				pubkeys: accountKeys,
-				commitment: 'processed',
-				onlyParsed: true
-			});
-
-			const parsedAccounts = (parsedData.value || []).filter((acc: any) => acc?.parsed === true);
-			// @ts-ignore
-			const accountsPromises = Promise.all(parsedAccounts.map(acc => upsertParsedAccount(db, acc)));
+			let accountsPromises = Promise.resolve();
+			try {
+				const parsedData = await fetchParsedAccounts(env.RPC_URL, env.RPCX_URL, txAccountKeys);
+				const parsedAccounts = (parsedData.value || []).filter((acc: any) => acc?.parsed === true);
+				// @ts-ignore
+				accountsPromises = Promise.all(parsedAccounts.map(acc => upsertParsedAccount(db, acc)));
+			} catch (error) {
+				console.warn('Account parsing skipped:', error);
+			}
 
 			await txPromises;
 			await accountsPromises;

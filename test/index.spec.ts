@@ -90,6 +90,76 @@ describe('RPC fallbacks', () => {
 		}, null]);
 	});
 
+	it('extracts token balance changes from transaction metadata', () => {
+		const result = __testables.extractTokenBalanceChanges({
+			meta: {
+				preTokenBalances: [{
+					accountIndex: 1,
+					mint: 'Mint111',
+					owner: 'Owner111',
+					programId: 'Token111',
+					uiTokenAmount: {
+						amount: '1500',
+						decimals: 2,
+						uiAmountString: '15'
+					}
+				}],
+				postTokenBalances: [{
+					accountIndex: 1,
+					mint: 'Mint111',
+					owner: 'Owner111',
+					programId: 'Token111',
+					uiTokenAmount: {
+						amount: '1200',
+						decimals: 2,
+						uiAmountString: '12'
+					}
+				}]
+			}
+		}, ['payer', 'TokenAccount111']);
+
+		expect(result).toEqual([{
+			account: 'TokenAccount111',
+			accountIndex: 1,
+			deltaAmount: '-300',
+			deltaUiAmountString: '-3',
+			decimals: 2,
+			mint: 'Mint111',
+			owner: 'Owner111',
+			postAmount: '1200',
+			postUiAmountString: '12',
+			preAmount: '1500',
+			preUiAmountString: '15',
+			programId: 'Token111'
+		}]);
+	});
+
+	it('uses the incoming transaction payload when it already contains a processable message', async () => {
+		const fetchMock = vi.spyOn(globalThis, 'fetch');
+		const requestTxResult = {
+			transaction: {
+				signatures: ['signature'],
+				message: {
+					accountKeys: [{ pubkey: 'payer' }],
+					instructions: [{ programId: 'Program111', accounts: ['payer'], data: 'abcd' }]
+				}
+			},
+			meta: {
+				innerInstructions: []
+			}
+		};
+
+		const result = await __testables.resolveTransactionResult(
+			'https://rpc.example',
+			'https://rpcx.example',
+			'signature',
+			requestTxResult
+		);
+
+		expect(result).toBe(requestTxResult);
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
 	it('stores raw instruction data only when the instruction has accounts', () => {
 		expect(__testables.getInstructionData({
 			data: 'abcd'

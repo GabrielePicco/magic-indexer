@@ -7,7 +7,10 @@ interface Env {
 	RPC_URL: string;
 	RPCX_URL: string;
 	AUTH_HEADER: string;
+	DEBUG_LOGS?: string;
 }
+
+const SCHEMA_RETRY_DELAY_MS = 50;
 
 function isDefined<T>(value: T | null | undefined): value is T {
 	return value !== undefined && value !== null;
@@ -74,18 +77,134 @@ function normalizeParsedAccount(pubkey: string, account: any) {
 	};
 }
 
+function hasProcessableTransaction(txResult: any): boolean {
+	const message = txResult?.transaction?.message;
+	return normalizeAccountKeys(message?.accountKeys).length > 0 && Array.isArray(message?.instructions) &&
+		message.instructions.length > 0;
+}
+
+function getTransactionEvents(txResult: any): any[] {
+	if (Array.isArray(txResult?.transaction?.events)) return txResult.transaction.events;
+	if (Array.isArray(txResult?.events)) return txResult.events;
+	return [];
+}
+
+function formatTokenAmount(amount: string, decimals: number): string {
+	const negative = amount.startsWith('-');
+	const digits = negative ? amount.slice(1) : amount;
+
+	if (decimals === 0) return `${negative ? '-' : ''}${digits}`;
+
+	const padded = digits.padStart(decimals + 1, '0');
+	const whole = padded.slice(0, padded.length - decimals).replace(/^0+(?=\d)/, '');
+	const fraction = padded.slice(padded.length - decimals).replace(/0+$/, '');
+
+	return `${negative ? '-' : ''}${fraction ? `${whole}.${fraction}` : whole}`;
+}
+
+function getTokenBalanceKey(balance: any): string | null {
+	if (typeof balance?.accountIndex !== 'number') return null;
+	if (typeof balance?.mint !== 'string') return null;
+	return `${balance.accountIndex}:${balance.mint}`;
+}
+
+function extractTokenBalanceChanges(txResult: any, accountKeys: string[]): any[] {
+	const preTokenBalances = Array.isArray(txResult?.meta?.preTokenBalances) ? txResult.meta.preTokenBalances : [];
+	const postTokenBalances = Array.isArray(txResult?.meta?.postTokenBalances) ? txResult.meta.postTokenBalances : [];
+
+	if (preTokenBalances.length === 0 && postTokenBalances.length === 0) return [];
+
+	const tokenBalances = new Map<string, { pre?: any; post?: any }>();
+
+	for (const balance of preTokenBalances) {
+		const key = getTokenBalanceKey(balance);
+		if (!key) continue;
+		tokenBalances.set(key, { ...(tokenBalances.get(key) || {}), pre: balance });
+	}
+
+	for (const balance of postTokenBalances) {
+		const key = getTokenBalanceKey(balance);
+		if (!key) continue;
+		tokenBalances.set(key, { ...(tokenBalances.get(key) || {}), post: balance });
+	}
+
+	return Array.from(tokenBalances.values())
+		.map(({ pre, post }) => {
+			const tokenBalance = post || pre;
+			if (!tokenBalance) return null;
+
+			const accountIndex = tokenBalance.accountIndex;
+			const decimals = post?.uiTokenAmount?.decimals ?? pre?.uiTokenAmount?.decimals ?? 0;
+			const preAmount = pre?.uiTokenAmount?.amount ?? '0';
+			const postAmount = post?.uiTokenAmount?.amount ?? '0';
+
+			if (preAmount === postAmount) return null;
+
+			const deltaAmount = (BigInt(postAmount) - BigInt(preAmount)).toString();
+
+			return {
+				account: typeof accountIndex === 'number' ? accountKeys[accountIndex] : undefined,
+				accountIndex,
+				deltaAmount,
+				deltaUiAmountString: formatTokenAmount(deltaAmount, decimals),
+				decimals,
+				mint: tokenBalance.mint,
+				owner: post?.owner ?? pre?.owner,
+				postAmount,
+				postUiAmountString: post?.uiTokenAmount?.uiAmountString ?? formatTokenAmount(postAmount, decimals),
+				preAmount,
+				preUiAmountString: pre?.uiTokenAmount?.uiAmountString ?? formatTokenAmount(preAmount, decimals),
+				programId: post?.programId ?? pre?.programId
+			};
+		})
+		.filter(isDefined)
+		.sort((left, right) => left.accountIndex - right.accountIndex);
+}
+
+function isDebugEnabled(env: Env): boolean {
+	return env.DEBUG_LOGS === '1' || env.DEBUG_LOGS === 'true';
+}
+
+function debugLog(env: Env, message: string, data?: Record<string, unknown>) {
+	if (!isDebugEnabled(env)) return;
+	if (data) {
+		console.log(message, data);
+		return;
+	}
+	console.log(message);
+}
+
+function isCreateTableRace(error: any): boolean {
+	return error?.code === '42P07' || (error?.code === '23505' && error?.constraint_name === 'pg_type_typname_nsp_index');
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 function getDb(dbUrl: string) {
 	return postgres(dbUrl);
 }
 
 async function ensureTableExists(db: postgres.Sql, tableName: string, schema: string, comment?: string) {
-	await db.unsafe(`CREATE TABLE IF NOT EXISTS ${tableName}
-									 (
-										 ${schema}
-									 )`);
-	if (comment) {
-		const safeComment = comment.replace(/'/g, '\'\'');
-		await db.unsafe(`COMMENT ON TABLE ${tableName} IS '${safeComment}'`);
+	const safeComment = comment?.replace(/'/g, '\'\'');
+
+	for (let attempt = 0; ; attempt++) {
+		try {
+			await db.unsafe(`CREATE TABLE IF NOT EXISTS ${tableName}
+										 (
+											 ${schema}
+										 )`);
+			if (safeComment) {
+				await db.unsafe(`COMMENT ON TABLE ${tableName} IS '${safeComment}'`);
+			}
+			return;
+		} catch (error: any) {
+			if (!isCreateTableRace(error) || attempt >= 2) {
+				throw error;
+			}
+			await sleep(SCHEMA_RETRY_DELAY_MS * (attempt + 1));
+		}
 	}
 }
 
@@ -101,8 +220,14 @@ async function columnExists(db: postgres.Sql, tableName: string, columnName: str
 
 async function addColumnIfMissing(db: postgres.Sql, tableName: string, columnName: string, columnType: string) {
 	if (!(await columnExists(db, tableName, columnName))) {
-		await db.unsafe(`ALTER TABLE ${tableName}
-			ADD COLUMN ${columnName} ${columnType}`);
+		try {
+			await db.unsafe(`ALTER TABLE ${tableName}
+				ADD COLUMN ${columnName} ${columnType}`);
+		} catch (error: any) {
+			if (error?.code !== '42701') {
+				throw error;
+			}
+		}
 	}
 }
 
@@ -112,6 +237,7 @@ async function upsertTransaction(db: postgres.Sql, programId: string, programNam
 	data: any;
 	name: string;
 	events: string[];
+	tokenBalanceChanges: any[];
 	accounts: string[];
 	signature: string;
 }) {
@@ -125,21 +251,24 @@ async function upsertTransaction(db: postgres.Sql, programId: string, programNam
 		   name TEXT,
 		   data JSONB,
 		   accounts TEXT[],
+		   tokenBalanceChanges JSONB,
 		   timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP`,
 		`${programName}: transactions for program (${programId})`
 	);
 
 	await addColumnIfMissing(db, tableName, 'events', 'JSONB');
+	await addColumnIfMissing(db, tableName, 'tokenBalanceChanges', 'JSONB');
 
 	await db`
-		INSERT INTO ${db(tableName)} (signature, feePayer, name, data, accounts, events)
+		INSERT INTO ${db(tableName)} (signature, feePayer, name, data, accounts, events, tokenBalanceChanges)
 		VALUES (${tx.signature}, ${tx.feePayer}, ${tx.name}, ${tx.data}, ${tx.accounts},
-						${tx.events}) ON CONFLICT (signature) DO
+						${tx.events}, ${tx.tokenBalanceChanges}) ON CONFLICT (signature) DO
 		UPDATE SET
 			name = EXCLUDED.name,
 			data = EXCLUDED.data,
 			accounts = EXCLUDED.accounts,
-			events = EXCLUDED.events
+			events = EXCLUDED.events,
+			tokenBalanceChanges = EXCLUDED.tokenBalanceChanges
 	`;
 }
 
@@ -226,6 +355,11 @@ async function fetchParsedTransaction(rpcUrl: string, rpcxUrl: string, signature
 	}
 }
 
+async function resolveTransactionResult(rpcUrl: string, rpcxUrl: string, signature: string, txResult: any): Promise<any> {
+	if (hasProcessableTransaction(txResult)) return txResult;
+	return fetchParsedTransaction(rpcUrl, rpcxUrl, signature);
+}
+
 async function fetchParsedAccounts(rpcUrl: string, rpcxUrl: string, accountKeys: string[]): Promise<any> {
 	if (accountKeys.length === 0) return { value: [] };
 
@@ -248,9 +382,11 @@ async function fetchParsedAccounts(rpcUrl: string, rpcxUrl: string, accountKeys:
 }
 
 export const __testables = {
+	extractTokenBalanceChanges,
 	fetchParsedAccounts,
 	fetchParsedTransaction,
-	getInstructionData
+	getInstructionData,
+	resolveTransactionResult
 };
 
 export default {
@@ -268,19 +404,32 @@ export default {
 
 		try {
 			const body: any = await request.json();
-			const signature = body?.[0]?.transaction?.signatures?.[0];
-			const accountKeys = normalizeAccountKeys(body?.[0]?.transaction?.message?.accountKeys);
+			const requestTxResult = body?.[0];
+			const signature = requestTxResult?.transaction?.signatures?.[0];
+			const accountKeys = normalizeAccountKeys(requestTxResult?.transaction?.message?.accountKeys);
+			debugLog(env, 'Processing transaction request', {
+				signature,
+				accountKeyCount: accountKeys.length
+			});
 
 			if (!signature || accountKeys.length === 0) {
 				return new Response('Invalid input', { status: 400 });
 			}
 
-			const txResult = await fetchParsedTransaction(env.RPC_URL, env.RPCX_URL, signature);
+			const txResult = await resolveTransactionResult(env.RPC_URL, env.RPCX_URL, signature, requestTxResult);
 			const message = txResult?.transaction?.message;
 			const resolvedAccountKeys = normalizeAccountKeys(message?.accountKeys);
 			const txAccountKeys = resolvedAccountKeys.length > 0 ? resolvedAccountKeys : accountKeys;
 			const feePayer = normalizeAccountKey(message?.accountKeys?.[0]) ?? txAccountKeys[0];
-			const events = txResult?.transaction?.events || [];
+			const events = getTransactionEvents(txResult);
+			const tokenBalanceChanges = extractTokenBalanceChanges(txResult, txAccountKeys);
+			debugLog(env, 'Transaction resolved', {
+				signature,
+				instructionCount: message?.instructions?.length || 0,
+				resolvedAccountKeyCount: txAccountKeys.length,
+				tokenBalanceChangeCount: tokenBalanceChanges.length,
+				usedRequestPayload: txResult === requestTxResult
+			});
 
 			// Detect if the transaction contains delegations
 			const delegationMatches: {
@@ -315,12 +464,17 @@ export default {
 			});
 			if (isDelegation) {
 				const extractedProgramId = delegationMatches[0].parentProgramId;
+				debugLog(env, 'Delegation transaction detected', {
+					signature,
+					parentProgramId: extractedProgramId
+				});
 				await upsertTransaction(db, DELEGATION_PROGRAM, 'Delegation Program', {
 					feePayer,
 					name: 'delegate',
 					data: { program: extractedProgramId },
 					accounts: txAccountKeys,
 					events,
+					tokenBalanceChanges,
 					signature
 				});
 			}
@@ -338,6 +492,7 @@ export default {
 							name: getInstructionName(inst),
 							data,
 							events,
+							tokenBalanceChanges,
 							accounts,
 							signature
 						});
@@ -349,6 +504,10 @@ export default {
 			try {
 				const parsedData = await fetchParsedAccounts(env.RPC_URL, env.RPCX_URL, txAccountKeys);
 				const parsedAccounts = (parsedData.value || []).filter((acc: any) => acc?.parsed === true);
+				debugLog(env, 'Parsed accounts fetched', {
+					signature,
+					parsedAccountCount: parsedAccounts.length
+				});
 				// @ts-ignore
 				accountsPromises = Promise.all(parsedAccounts.map(acc => upsertParsedAccount(db, acc)));
 			} catch (error) {
@@ -357,6 +516,7 @@ export default {
 
 			await txPromises;
 			await accountsPromises;
+			debugLog(env, 'Transaction stored', { signature });
 
 			return new Response('Account data stored', { status: 200 });
 		} catch (err: any) {

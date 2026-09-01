@@ -330,7 +330,7 @@ async function upsertTransaction(db: postgres.Sql, programId: string, programNam
 	await db`
 		INSERT INTO ${db(tableName)} (signature, feePayer, name, data, accounts, events, tokenBalanceChanges)
 		VALUES (${tx.signature}, ${tx.feePayer}, ${tx.name}, ${tx.data}, ${tx.accounts},
-						${tx.events}, ${tx.tokenBalanceChanges}) ON CONFLICT (signature) DO
+						${db.json(tx.events)}, ${db.json(tx.tokenBalanceChanges)}) ON CONFLICT (signature) DO
 		UPDATE SET
 			name = EXCLUDED.name,
 			data = EXCLUDED.data,

@@ -242,9 +242,10 @@ function sleep(ms: number): Promise<void> {
 }
 
 // Workers tie sockets to the request context, so the connection cannot be
-// shared across invocations; open one lean connection and close it when done.
+// shared across invocations; open one connection and close it when done.
+// Type fetching must stay enabled: array parameters (accounts TEXT[]) rely on it.
 function getDb(dbUrl: string) {
-	return postgres(dbUrl, { max: 1, prepare: false, fetch_types: false });
+	return postgres(dbUrl, { max: 1, prepare: false });
 }
 
 async function ensureTableExists(db: postgres.Sql, tableName: string, schema: string, comment?: string) {

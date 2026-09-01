@@ -12,6 +12,65 @@ interface Env {
 
 const SCHEMA_RETRY_DELAY_MS = 50;
 
+// In-isolate caches, best-effort by design: isolates are ephemeral and not
+// shared across locations, but retry storms land on warm isolates, which is
+// where the savings matter. The data path stays idempotent without them.
+const ensuredSchemas = new Set<string>();
+const processedSignatures = new Map<string, number>();
+const fetchedAccounts = new Map<string, number>();
+
+const PROCESSED_SIGNATURE_TTL_MS = 10 * 60 * 1000;
+const FETCHED_ACCOUNT_TTL_MS = 30 * 1000;
+const CACHE_MAX_ENTRIES = 10_000;
+
+// TTLs are enforced at read time; pruning only bounds memory, so it runs
+// just when a cache is at capacity.
+function pruneCache(cache: Map<string, number>, ttlMs: number) {
+	if (cache.size < CACHE_MAX_ENTRIES) return;
+	const now = Date.now();
+	for (const [key, timestamp] of cache) {
+		if (now - timestamp > ttlMs) {
+			cache.delete(key);
+		}
+	}
+	for (const key of cache.keys()) {
+		if (cache.size <= CACHE_MAX_ENTRIES) break;
+		cache.delete(key);
+	}
+}
+
+function wasRecentlyProcessed(signature: string): boolean {
+	const timestamp = processedSignatures.get(signature);
+	return timestamp !== undefined && Date.now() - timestamp <= PROCESSED_SIGNATURE_TTL_MS;
+}
+
+// Marked before processing starts so overlapping deliveries of the same
+// signature collapse into one; unmarked on failure so a later retry gets through.
+function markProcessed(signature: string) {
+	pruneCache(processedSignatures, PROCESSED_SIGNATURE_TTL_MS);
+	processedSignatures.set(signature, Date.now());
+}
+
+function unmarkProcessed(signature: string) {
+	processedSignatures.delete(signature);
+}
+
+function filterRecentlyFetchedAccounts(accountKeys: string[]): string[] {
+	const now = Date.now();
+	return accountKeys.filter(key => {
+		const timestamp = fetchedAccounts.get(key);
+		return timestamp === undefined || now - timestamp > FETCHED_ACCOUNT_TTL_MS;
+	});
+}
+
+function markAccountsFetched(accountKeys: string[]) {
+	pruneCache(fetchedAccounts, FETCHED_ACCOUNT_TTL_MS);
+	const now = Date.now();
+	for (const key of accountKeys) {
+		fetchedAccounts.set(key, now);
+	}
+}
+
 function isDefined<T>(value: T | null | undefined): value is T {
 	return value !== undefined && value !== null;
 }
@@ -182,11 +241,15 @@ function sleep(ms: number): Promise<void> {
 	return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Workers tie sockets to the request context, so the connection cannot be
+// shared across invocations; open one lean connection and close it when done.
 function getDb(dbUrl: string) {
-	return postgres(dbUrl);
+	return postgres(dbUrl, { max: 1, prepare: false, fetch_types: false });
 }
 
 async function ensureTableExists(db: postgres.Sql, tableName: string, schema: string, comment?: string) {
+	if (ensuredSchemas.has(tableName)) return;
+
 	const safeComment = comment?.replace(/'/g, '\'\'');
 
 	for (let attempt = 0; ; attempt++) {
@@ -198,6 +261,7 @@ async function ensureTableExists(db: postgres.Sql, tableName: string, schema: st
 			if (safeComment) {
 				await db.unsafe(`COMMENT ON TABLE ${tableName} IS '${safeComment}'`);
 			}
+			ensuredSchemas.add(tableName);
 			return;
 		} catch (error: any) {
 			if (!isCreateTableRace(error) || attempt >= 2) {
@@ -219,6 +283,9 @@ async function columnExists(db: postgres.Sql, tableName: string, columnName: str
 }
 
 async function addColumnIfMissing(db: postgres.Sql, tableName: string, columnName: string, columnType: string) {
+	const cacheKey = `${tableName}.${columnName}`;
+	if (ensuredSchemas.has(cacheKey)) return;
+
 	if (!(await columnExists(db, tableName, columnName))) {
 		try {
 			await db.unsafe(`ALTER TABLE ${tableName}
@@ -229,6 +296,7 @@ async function addColumnIfMissing(db: postgres.Sql, tableName: string, columnNam
 			}
 		}
 	}
+	ensuredSchemas.add(cacheKey);
 }
 
 
@@ -385,12 +453,129 @@ export const __testables = {
 	extractTokenBalanceChanges,
 	fetchParsedAccounts,
 	fetchParsedTransaction,
+	filterRecentlyFetchedAccounts,
 	getInstructionData,
-	resolveTransactionResult
+	markAccountsFetched,
+	markProcessed,
+	resolveTransactionResult,
+	wasRecentlyProcessed
 };
 
+async function processTransaction(env: Env, requestTxResult: any, signature: string, accountKeys: string[]) {
+	const db = getDb(env.DB_URL);
+
+	try {
+		const txResult = await resolveTransactionResult(env.RPC_URL, env.RPCX_URL, signature, requestTxResult);
+		const message = txResult?.transaction?.message;
+		const resolvedAccountKeys = normalizeAccountKeys(message?.accountKeys);
+		const txAccountKeys = resolvedAccountKeys.length > 0 ? resolvedAccountKeys : accountKeys;
+		const feePayer = normalizeAccountKey(message?.accountKeys?.[0]) ?? txAccountKeys[0];
+		const events = getTransactionEvents(txResult);
+		const tokenBalanceChanges = extractTokenBalanceChanges(txResult, txAccountKeys);
+		debugLog(env, 'Transaction resolved', {
+			signature,
+			instructionCount: message?.instructions?.length || 0,
+			resolvedAccountKeyCount: txAccountKeys.length,
+			tokenBalanceChangeCount: tokenBalanceChanges.length,
+			usedRequestPayload: txResult === requestTxResult
+		});
+
+		// Detect if the transaction contains delegations
+		const delegationMatches: {
+			parentProgramId: string;
+		}[] = [];
+		const isDelegation = txResult.meta?.innerInstructions?.some((innerInstruction: any) => {
+			try {
+				return innerInstruction.instructions?.some((ix: any) => {
+					const mappedProgramId = getInstructionProgramId(ix, txAccountKeys);
+					const parentIndex = innerInstruction.index;
+					const parentProgramId = getInstructionProgramId(
+						txResult.transaction.message.instructions[parentIndex],
+						txAccountKeys
+					);
+
+					const match =
+						mappedProgramId === DELEGATION_PROGRAM &&
+						typeof ix.data === 'string' &&
+						ix.data.startsWith('11111111');
+
+					if (match) {
+						delegationMatches.push({
+							parentProgramId: parentProgramId ?? 'unknown'
+						});
+					}
+
+					return match;
+				});
+			} catch {
+				return false;
+			}
+		});
+		if (isDelegation) {
+			const extractedProgramId = delegationMatches[0].parentProgramId;
+			debugLog(env, 'Delegation transaction detected', {
+				signature,
+				parentProgramId: extractedProgramId
+			});
+			await upsertTransaction(db, DELEGATION_PROGRAM, 'Delegation Program', {
+				feePayer,
+				name: 'delegate',
+				data: { program: extractedProgramId },
+				accounts: txAccountKeys,
+				events,
+				tokenBalanceChanges,
+				signature
+			});
+		}
+
+		// Parse
+		let txPromises = Promise.all(
+			(message?.instructions || []).map(async (inst: any) => {
+				const programId = getInstructionProgramId(inst, txAccountKeys);
+				const accounts = getInstructionAccounts(inst, txAccountKeys);
+				const data = getInstructionData(inst, accounts);
+
+				if (programId && data) {
+					await upsertTransaction(db, programId, inst.programName || inst.program || programId, {
+						feePayer,
+						name: getInstructionName(inst),
+						data,
+						events,
+						tokenBalanceChanges,
+						accounts,
+						signature
+					});
+				}
+			})
+		);
+
+		let accountsPromises = Promise.resolve();
+		try {
+			const staleAccountKeys = filterRecentlyFetchedAccounts(txAccountKeys);
+			const parsedData = await fetchParsedAccounts(env.RPC_URL, env.RPCX_URL, staleAccountKeys);
+			const parsedAccounts = (parsedData.value || []).filter((acc: any) => acc?.parsed === true);
+			debugLog(env, 'Parsed accounts fetched', {
+				signature,
+				requestedAccountCount: staleAccountKeys.length,
+				parsedAccountCount: parsedAccounts.length
+			});
+			// @ts-ignore
+			accountsPromises = Promise.all(parsedAccounts.map(acc => upsertParsedAccount(db, acc)))
+				.then(() => markAccountsFetched(staleAccountKeys));
+		} catch (error) {
+			console.warn('Account parsing skipped:', error);
+		}
+
+		await txPromises;
+		await accountsPromises;
+		debugLog(env, 'Transaction stored', { signature });
+	} finally {
+		await db.end({ timeout: 5 });
+	}
+}
+
 export default {
-	async fetch(request, env: Env, _ctx): Promise<Response> {
+	async fetch(request, env: Env, ctx): Promise<Response> {
 		if (request.method !== 'POST') {
 			return new Response('Method Not Allowed', { status: 405 });
 		}
@@ -400,128 +585,43 @@ export default {
 			return new Response('Unauthorized', { status: 401 });
 		}
 
-		const db = getDb(env.DB_URL);
-
+		let body: any;
 		try {
-			const body: any = await request.json();
-			const requestTxResult = body?.[0];
-			const signature = requestTxResult?.transaction?.signatures?.[0];
-			const accountKeys = normalizeAccountKeys(requestTxResult?.transaction?.message?.accountKeys);
-			debugLog(env, 'Processing transaction request', {
-				signature,
-				accountKeyCount: accountKeys.length
-			});
-
-			if (!signature || accountKeys.length === 0) {
-				return new Response('Invalid input', { status: 400 });
-			}
-
-			const txResult = await resolveTransactionResult(env.RPC_URL, env.RPCX_URL, signature, requestTxResult);
-			const message = txResult?.transaction?.message;
-			const resolvedAccountKeys = normalizeAccountKeys(message?.accountKeys);
-			const txAccountKeys = resolvedAccountKeys.length > 0 ? resolvedAccountKeys : accountKeys;
-			const feePayer = normalizeAccountKey(message?.accountKeys?.[0]) ?? txAccountKeys[0];
-			const events = getTransactionEvents(txResult);
-			const tokenBalanceChanges = extractTokenBalanceChanges(txResult, txAccountKeys);
-			debugLog(env, 'Transaction resolved', {
-				signature,
-				instructionCount: message?.instructions?.length || 0,
-				resolvedAccountKeyCount: txAccountKeys.length,
-				tokenBalanceChangeCount: tokenBalanceChanges.length,
-				usedRequestPayload: txResult === requestTxResult
-			});
-
-			// Detect if the transaction contains delegations
-			const delegationMatches: {
-				parentProgramId: string;
-			}[] = [];
-			const isDelegation = txResult.meta?.innerInstructions?.some((innerInstruction: any) => {
-				try {
-					return innerInstruction.instructions?.some((ix: any) => {
-						const mappedProgramId = getInstructionProgramId(ix, txAccountKeys);
-						const parentIndex = innerInstruction.index;
-						const parentProgramId = getInstructionProgramId(
-							txResult.transaction.message.instructions[parentIndex],
-							txAccountKeys
-						);
-
-						const match =
-							mappedProgramId === DELEGATION_PROGRAM &&
-							typeof ix.data === 'string' &&
-							ix.data.startsWith('11111111');
-
-						if (match) {
-							delegationMatches.push({
-								parentProgramId: parentProgramId ?? 'unknown'
-							});
-						}
-
-						return match;
-					});
-				} catch {
-					return false;
-				}
-			});
-			if (isDelegation) {
-				const extractedProgramId = delegationMatches[0].parentProgramId;
-				debugLog(env, 'Delegation transaction detected', {
-					signature,
-					parentProgramId: extractedProgramId
-				});
-				await upsertTransaction(db, DELEGATION_PROGRAM, 'Delegation Program', {
-					feePayer,
-					name: 'delegate',
-					data: { program: extractedProgramId },
-					accounts: txAccountKeys,
-					events,
-					tokenBalanceChanges,
-					signature
-				});
-			}
-
-			// Parse
-			let txPromises = Promise.all(
-				(message?.instructions || []).map(async (inst: any) => {
-					const programId = getInstructionProgramId(inst, txAccountKeys);
-					const accounts = getInstructionAccounts(inst, txAccountKeys);
-					const data = getInstructionData(inst, accounts);
-
-					if (programId && data) {
-						await upsertTransaction(db, programId, inst.programName || inst.program || programId, {
-							feePayer,
-							name: getInstructionName(inst),
-							data,
-							events,
-							tokenBalanceChanges,
-							accounts,
-							signature
-						});
-					}
-				})
-			);
-
-			let accountsPromises = Promise.resolve();
-			try {
-				const parsedData = await fetchParsedAccounts(env.RPC_URL, env.RPCX_URL, txAccountKeys);
-				const parsedAccounts = (parsedData.value || []).filter((acc: any) => acc?.parsed === true);
-				debugLog(env, 'Parsed accounts fetched', {
-					signature,
-					parsedAccountCount: parsedAccounts.length
-				});
-				// @ts-ignore
-				accountsPromises = Promise.all(parsedAccounts.map(acc => upsertParsedAccount(db, acc)));
-			} catch (error) {
-				console.warn('Account parsing skipped:', error);
-			}
-
-			await txPromises;
-			await accountsPromises;
-			debugLog(env, 'Transaction stored', { signature });
-
-			return new Response('Account data stored', { status: 200 });
-		} catch (err: any) {
-			console.error('Error:', err);
-			return new Response(`Error: ${err.message}`, { status: 500 });
+			body = await request.json();
+		} catch {
+			return new Response('Invalid input', { status: 400 });
 		}
+
+		const requestTxResult = body?.[0];
+		const signature = requestTxResult?.transaction?.signatures?.[0];
+		const accountKeys = normalizeAccountKeys(requestTxResult?.transaction?.message?.accountKeys);
+		debugLog(env, 'Processing transaction request', {
+			signature,
+			accountKeyCount: accountKeys.length
+		});
+
+		if (!signature || accountKeys.length === 0) {
+			return new Response('Invalid input', { status: 400 });
+		}
+
+		if (wasRecentlyProcessed(signature)) {
+			debugLog(env, 'Duplicate delivery ignored', { signature });
+			return new Response('Already processed', { status: 200 });
+		}
+		markProcessed(signature);
+
+		// Acknowledge immediately and process in the background: slow responses
+		// make the webhook sender time out, requeue, and redeliver in storms.
+		ctx.waitUntil(
+			processTransaction(env, requestTxResult, signature, accountKeys).catch(err => {
+				unmarkProcessed(signature);
+				if (err?.code === '42P01' || err?.code === '42703') {
+					ensuredSchemas.clear();
+				}
+				console.error(`Error processing ${signature}:`, err);
+			})
+		);
+
+		return new Response('Accepted', { status: 200 });
 	}
 } satisfies ExportedHandler<Env>;

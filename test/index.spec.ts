@@ -173,3 +173,22 @@ describe('RPC fallbacks', () => {
 		});
 	});
 });
+
+describe('delivery dedupe and account fetch caching', () => {
+	it('marks signatures as processed and reports duplicates', () => {
+		const signature = `sig-${Date.now()}`;
+
+		expect(__testables.wasRecentlyProcessed(signature)).toBe(false);
+		__testables.markProcessed(signature);
+		expect(__testables.wasRecentlyProcessed(signature)).toBe(true);
+	});
+
+	it('filters out recently fetched accounts', () => {
+		const fresh = `fresh-${Date.now()}`;
+		const stale = `stale-${Date.now()}`;
+
+		__testables.markAccountsFetched([fresh]);
+
+		expect(__testables.filterRecentlyFetchedAccounts([fresh, stale])).toEqual([stale]);
+	});
+});

@@ -244,8 +244,10 @@ function sleep(ms: number): Promise<void> {
 // Workers tie sockets to the request context, so the connection cannot be
 // shared across invocations; open one connection and close it when done.
 // Type fetching must stay enabled: array parameters (accounts TEXT[]) rely on it.
+// The connect timeout keeps saturated-database periods failing fast (and
+// retryable) instead of hanging until the 30s waitUntil kill.
 function getDb(dbUrl: string) {
-	return postgres(dbUrl, { max: 1, prepare: false });
+	return postgres(dbUrl, { max: 1, prepare: false, connect_timeout: 10 });
 }
 
 async function ensureTableExists(db: postgres.Sql, tableName: string, schema: string, comment?: string) {
@@ -375,6 +377,8 @@ async function rpcFetchDirect(rpcUrl: string, method: string, params: any): Prom
 	return rpcRequest(rpcUrl, {}, method, params);
 }
 
+const RPC_REQUEST_TIMEOUT_MS = 8000;
+
 async function rpcRequest(url: string, headers: Record<string, string>, method: string, params: any): Promise<any> {
 	const body = {
 		jsonrpc: '2.0',
@@ -389,7 +393,8 @@ async function rpcRequest(url: string, headers: Record<string, string>, method: 
 			'Content-Type': 'application/json',
 			...headers
 		},
-		body: JSON.stringify(body)
+		body: JSON.stringify(body),
+		signal: AbortSignal.timeout(RPC_REQUEST_TIMEOUT_MS)
 	});
 
 	const text = await res.text();
